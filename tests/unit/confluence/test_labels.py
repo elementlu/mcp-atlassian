@@ -127,3 +127,35 @@ class TestLabelsMixin:
         # Act/Assert
         with pytest.raises(Exception, match="Failed to add label"):
             labels_mixin.add_page_label("987654321", "test")
+
+
+class TestLabelsMixinCloudOAuth:
+    """On Cloud OAuth the v1 label endpoint is gone (410), so v2 must be used."""
+
+    def test_get_page_labels_uses_v2_adapter(self, confluence_client):
+        from unittest.mock import MagicMock, PropertyMock
+
+        with patch(
+            "mcp_atlassian.confluence.labels.ConfluenceClient.__init__"
+        ) as mock_init:
+            mock_init.return_value = None
+            mixin = LabelsMixin()
+            mixin.confluence = MagicMock()
+            mixin.config = confluence_client.config
+            mixin.preprocessor = confluence_client.preprocessor
+
+        adapter = MagicMock()
+        adapter.get_page_labels.return_value = {
+            "results": [
+                {"id": "1", "name": "alpha", "prefix": "global", "label": "alpha"}
+            ],
+            "size": 1,
+        }
+        with patch.object(
+            LabelsMixin, "_v2_adapter", new_callable=PropertyMock, return_value=adapter
+        ):
+            result = mixin.get_page_labels("123")
+
+        adapter.get_page_labels.assert_called_once_with("123")
+        mixin.confluence.get_page_labels.assert_not_called()
+        assert [lbl.name for lbl in result] == ["alpha"]

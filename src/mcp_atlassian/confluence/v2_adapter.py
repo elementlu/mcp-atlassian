@@ -307,12 +307,15 @@ class ConfluenceV2Adapter:
         self,
         page_id: str,
         expand: str | None = None,
+        version: int | None = None,
     ) -> dict[str, Any]:
         """Get a page using the v2 API.
 
         Args:
             page_id: The ID of the page to retrieve
             expand: Fields to expand in the response (not used in v2 API, for compatibility only)
+            version: Optional previously published version number to retrieve
+                (the v2 ``version`` query parameter); the current version when omitted
 
         Returns:
             The page data from the API response in v1-compatible format
@@ -325,7 +328,9 @@ class ConfluenceV2Adapter:
             url = f"{self.base_url}/api/v2/pages/{page_id}"
 
             # Convert v1 expand parameters to v2 format
-            params = {"body-format": "storage"}
+            params: dict[str, Any] = {"body-format": "storage"}
+            if version is not None:
+                params["version"] = version
 
             response = self.session.get(url, params=params)
             response.raise_for_status()
@@ -1215,109 +1220,134 @@ class ConfluenceV2Adapter:
         version: int,
         expand: str | None = None,
     ) -> dict[str, Any]:
-        """Get a specific version of a page using the versions API.
+        """Get a specific version of a page using the v2 API.
 
-        Note: The v2 API uses version IDs, not version numbers. We need to:
-        1. List all versions to find the version ID for the given version number
-        2. Fetch the specific version using its version ID
+        Uses ``GET /api/v2/pages/{id}?version=N``. The previous implementation
+        listed ``/pages/{id}/versions`` and then looked for an ``id`` on each
+        version object to call ``/api/v2/versions/{id}``; v2 version objects
+        carry a ``number`` and no ``id``, so the lookup failed with "Version N
+        not found" even for existing versions (found 2026-11-12 on Cloud).
 
         Args:
             page_id: The ID of page
             version: The version number to retrieve
-            expand: Fields to expand in the response
+            expand: Fields to expand in the response (compatibility only)
 
         Returns:
             The page data for the specified version in v1-compatible format
 
         Raises:
-            ValueError: If page retrieval fails or version not found
+            ValueError: If page retrieval fails or the version does not exist
         """
         try:
-            # Step 1: Get all versions to find the version ID
-            versions_list = self.get_page_versions_list(page_id)
-
-            # Find the version with the matching version number
-            version_id = None
-            for ver in versions_list:
-                if ver.get("number") == version:
-                    version_id = ver.get("id")
-                    break
-
-            if not version_id:
-                raise ValueError(f"Version {version} not found for page '{page_id}'")
-
-            # Step 2: Fetch the specific version using its version ID
-            url = f"{self.base_url}/api/v2/versions/{version_id}"
-
-            # Convert v1 expand parameters to v2 format
-            params = {"body-format": "storage"}
-
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-
-            v2_response = response.json()
-            logger.debug(f"Successfully retrieved page '{page_id}' version {version}")
-
-            # Get space key from space ID if present
-            space_id = v2_response.get("spaceId")
-            space_key = self._get_space_key_from_id(space_id) if space_id else "unknown"
-
-            # Convert v2 response to v1-compatible format
-            v1_compatible = self._convert_v2_to_v1_format(v2_response, space_key)
-
-            # Add body.storage structure if body content exists
-            if "body" in v2_response and v2_response["body"].get("storage"):
-                storage_value = v2_response["body"]["storage"].get("value", "")
-                v1_compatible["body"] = {
-                    "storage": {"value": storage_value, "representation": "storage"}
-                }
-
-            # Add version information from version response
-            # In versions API, version info is at the top level
-            if "number" in v2_response:
-                version_data: dict[str, Any] = {
-                    "number": v2_response.get("number"),
-                }
-                if created_at := v2_response.get("createdAt"):
-                    version_data["when"] = created_at
-                if message := v2_response.get("message"):
-                    version_data["message"] = message
-                if author := self._user_ref_from_account_id(
-                    v2_response.get("authorId")
-                ):
-                    version_data["by"] = author
-                v1_compatible["version"] = version_data
-            elif "version" in v2_response and "number" in v2_response["version"]:
-                v1_compatible["version"] = self._convert_v2_to_v1_format(
-                    v2_response, space_key
-                )["version"]
-
-            # Add space information
-            if space_id:
-                v1_compatible["space"] = {
-                    "key": space_key,
-                    "id": space_id,
-                }
-
-            # Add children.attachment for compatibility with v1 expand
-            if "children" in v2_response and "attachment" in v2_response["children"]:
-                v1_compatible.setdefault("children", {})["attachment"] = v2_response[
-                    "children"
-                ]["attachment"]
-
-            return v1_compatible
-
-        except Exception as e:
-            if isinstance(e, HTTPError) and e.response is not None:
-                logger.error(
-                    f"HTTP error getting page '{page_id}' version {version}: {e}\n"
-                    f"Response: {e.response.text}"
-                )
-            else:
-                logger.error(f"Error getting page '{page_id}' version {version}: {e}")
+            return self.get_page(page_id, expand=expand, version=version)
+        except ValueError as e:
             raise ValueError(
                 f"Failed to get page '{page_id}' version {version}: {e}"
             ) from e
+
+    def get_page_labels(self, page_id: str) -> dict[str, Any]:
+        """Get a page's labels using the v2 API.
+
+        The v1 ``/content/{id}/label`` endpoint now answers 410 Gone on Cloud
+        ("This deprecated endpoint has been removed"). The result is returned in
+        the v1 shape the label model expects.
+
+        Args:
+            page_id: The ID of the page
+
+        Returns:
+            ``{"results": [{"id", "name", "prefix", "label"}, ...], "size": N}``
+
+        Raises:
+            ValueError: If the request fails
+        """
+        try:
+            url = f"{self.base_url}/api/v2/pages/{page_id}/labels"
+            labels = self._get_all_comment_results(url, params={"limit": 250})
+            results = [
+                {
+                    "id": str(item.get("id", "")),
+                    "name": item.get("name", ""),
+                    "prefix": item.get("prefix", "global"),
+                    "label": item.get("name", ""),
+                }
+                for item in labels
+            ]
+            return {"results": results, "size": len(results)}
+        except Exception as e:
+            if isinstance(e, HTTPError) and e.response is not None:
+                logger.error(
+                    f"HTTP error getting labels for page '{page_id}': {e}\n"
+                    f"Response: {e.response.text}"
+                )
+            else:
+                logger.error(f"Error getting labels for page '{page_id}': {e}")
+            raise ValueError(f"Failed to get labels for page '{page_id}': {e}") from e
+
+    def get_space_pages(
+        self, space_key: str, limit: int = 500
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """List the pages of a space using the v2 API.
+
+        The v1 ``GET /content?spaceKey=`` listing now answers 410 Gone on Cloud.
+        v2 pages carry ``parentId`` and ``position``, which is enough to rebuild
+        the tree.
+
+        Args:
+            space_key: The space key
+            limit: Maximum number of pages to return
+
+        Returns:
+            ``(pages, has_more)`` where ``pages`` are raw v2 page objects and
+            ``has_more`` is True when the space has more pages than ``limit``.
+
+        Raises:
+            ValueError: If the space cannot be found or a request fails
+        """
+        try:
+            space_id = self._get_space_id(space_key)
+            url = f"{self.base_url}/api/v2/spaces/{space_id}/pages"
+            pages: list[dict[str, Any]] = []
+            cursor: str | None = None
+            seen_cursors: set[str | None] = set()
+            has_more = False
+
+            while cursor not in seen_cursors:
+                seen_cursors.add(cursor)
+                params: dict[str, Any] = {
+                    "limit": min(250, max(1, limit - len(pages))),
+                    "status": "current",
+                }
+                if cursor is not None:
+                    params["cursor"] = cursor
+
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                batch = data.get("results", [])
+                if not isinstance(batch, list):
+                    break
+                pages.extend(item for item in batch if isinstance(item, dict))
+
+                cursor = self._comment_next_cursor(response, data)
+                if len(pages) >= limit:
+                    has_more = bool(cursor)
+                    pages = pages[:limit]
+                    break
+                if not cursor:
+                    break
+
+            return pages, has_more
+        except Exception as e:
+            if isinstance(e, HTTPError) and e.response is not None:
+                logger.error(
+                    f"HTTP error listing pages of space '{space_key}': {e}\n"
+                    f"Response: {e.response.text}"
+                )
+            else:
+                logger.error(f"Error listing pages of space '{space_key}': {e}")
+            raise ValueError(f"Failed to list pages of space '{space_key}': {e}") from e
 
     def get_page_views(self, page_id: str) -> dict[str, Any]:
         """Get view statistics for a page using the Analytics API.

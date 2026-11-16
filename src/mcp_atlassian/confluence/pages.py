@@ -1243,6 +1243,12 @@ class PagesMixin(ConfluenceClient):
         try:
             limit = clamp_limit(limit, context="confluence.get_space_page_tree")
 
+            # Cloud OAuth: the v1 content listing was removed (410 Gone), so list the
+            # space's pages with the v2 API and rebuild the tree from parentId.
+            v2_adapter = self._v2_adapter
+            if v2_adapter:
+                return self._space_page_tree_from_v2(v2_adapter, space_key, limit)
+
             # Paginate using the raw API to access _links.next for reliable
             # truncation detection. The higher-level get_all_pages_from_space()
             # has a broken termination condition when limit > server-side cap.
@@ -1343,6 +1349,64 @@ class PagesMixin(ConfluenceClient):
         except Exception as e:
             logger.error(f"Error fetching page tree for space '{space_key}': {e}")
             raise Exception(f"Failed to fetch page tree: {e}") from e
+
+    @staticmethod
+    def _space_page_tree_from_v2(
+        v2_adapter: ConfluenceV2Adapter, space_key: str, limit: int
+    ) -> dict:
+        """Build the flat page tree for a space from v2 page objects."""
+        pages, has_more = v2_adapter.get_space_pages(space_key, limit=limit)
+        if not pages:
+            return {
+                "space_key": space_key,
+                "total_pages": 0,
+                "has_more": False,
+                "pages": [],
+            }
+
+        parent_of = {str(p.get("id")): p.get("parentId") for p in pages}
+
+        def depth_of(page_id: str) -> int:
+            depth = 0
+            current = parent_of.get(page_id)
+            # Walk up through fetched pages only; the guard stops a bad cycle.
+            while current is not None and str(current) in parent_of and depth < 200:
+                depth += 1
+                current = parent_of[str(current)]
+            return depth
+
+        result_pages = []
+        for page in pages:
+            page_id = str(page.get("id"))
+            raw_position = page.get("position")
+            try:
+                position = None if raw_position is None else int(raw_position)
+            except (TypeError, ValueError):
+                position = None
+            parent_id = page.get("parentId")
+            result_pages.append(
+                {
+                    "id": page_id,
+                    "title": page.get("title", "Untitled"),
+                    "parent_id": str(parent_id) if parent_id is not None else None,
+                    "position": position,
+                    "depth": depth_of(page_id),
+                }
+            )
+
+        result_pages.sort(
+            key=lambda p: (
+                p["depth"],
+                p["position"] if p["position"] is not None else 999999,
+                p["title"] or "",
+            )
+        )
+        return {
+            "space_key": space_key,
+            "total_pages": len(result_pages),
+            "has_more": has_more,
+            "pages": result_pages,
+        }
 
     def delete_page(self, page_id: str) -> bool:
         """

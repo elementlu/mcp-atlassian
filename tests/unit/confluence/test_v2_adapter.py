@@ -715,3 +715,121 @@ class TestConfluenceV2AdapterComments:
         assert payload["pageId"] == "12345"
         assert "parentCommentId" not in payload
         assert result["id"] == "333444555"
+
+
+class TestConfluenceV2AdapterCloudReplacements:
+    """v2 replacements for v1 endpoints Atlassian removed on Cloud (410 Gone)."""
+
+    @pytest.fixture
+    def mock_session(self):
+        return MagicMock(spec=requests.Session)
+
+    @pytest.fixture
+    def v2_adapter(self, mock_session):
+        return ConfluenceV2Adapter(
+            session=mock_session, base_url="https://example.atlassian.net/wiki"
+        )
+
+    @staticmethod
+    def _response(payload, links=None):
+        resp = Mock()
+        resp.status_code = 200
+        resp.json.return_value = payload
+        resp.links = links or {}
+        return resp
+
+    def test_get_page_by_version_uses_version_query_param(
+        self, v2_adapter, mock_session
+    ):
+        """History must not depend on version objects having an id (v2 has none)."""
+        page = self._response(
+            {
+                "id": "123",
+                "status": "historical",
+                "title": "Old title",
+                "spaceId": "789",
+                "version": {"number": 1, "createdAt": "2024-01-01T00:00:00Z"},
+                "body": {"storage": {"value": "<p>v1</p>"}},
+            }
+        )
+        space = self._response({"key": "TEST", "name": "Test"})
+        mock_session.get.side_effect = [page, space]
+
+        result = v2_adapter.get_page_by_version("123", 1)
+
+        first_call = mock_session.get.call_args_list[0]
+        assert first_call.args[0].endswith("/api/v2/pages/123")
+        assert first_call.kwargs["params"] == {"body-format": "storage", "version": 1}
+        assert all(
+            "/versions" not in c.args[0] for c in mock_session.get.call_args_list
+        )
+        assert result["version"]["number"] == 1
+        assert result["body"]["storage"]["value"] == "<p>v1</p>"
+        assert result["space"]["key"] == "TEST"
+
+    def test_get_page_by_version_wraps_errors(self, v2_adapter, mock_session):
+        bad = Mock()
+        bad.raise_for_status.side_effect = HTTPError("404", response=Mock(text="nope"))
+        mock_session.get.return_value = bad
+        with pytest.raises(ValueError, match="version 7"):
+            v2_adapter.get_page_by_version("123", 7)
+
+    def test_get_page_without_version_omits_param(self, v2_adapter, mock_session):
+        page = self._response({"id": "1", "title": "T", "version": {"number": 3}})
+        mock_session.get.return_value = page
+        v2_adapter.get_page("1")
+        assert mock_session.get.call_args_list[0].kwargs["params"] == {
+            "body-format": "storage"
+        }
+
+    def test_get_page_labels_maps_v2_to_v1_shape(self, v2_adapter, mock_session):
+        mock_session.get.return_value = self._response(
+            {"results": [{"id": "10", "name": "alpha", "prefix": "global"}]}
+        )
+        result = v2_adapter.get_page_labels("123")
+        assert mock_session.get.call_args.args[0].endswith("/api/v2/pages/123/labels")
+        assert result["size"] == 1
+        assert result["results"][0] == {
+            "id": "10",
+            "name": "alpha",
+            "prefix": "global",
+            "label": "alpha",
+        }
+
+    def test_get_page_labels_follows_cursor(self, v2_adapter, mock_session):
+        first = self._response(
+            {
+                "results": [{"id": "1", "name": "a"}],
+                "_links": {"next": "/wiki/api/v2/pages/123/labels?cursor=abc"},
+            }
+        )
+        second = self._response({"results": [{"id": "2", "name": "b"}]})
+        mock_session.get.side_effect = [first, second]
+        result = v2_adapter.get_page_labels("123")
+        assert [r["name"] for r in result["results"]] == ["a", "b"]
+        assert mock_session.get.call_args_list[1].kwargs["params"]["cursor"] == "abc"
+
+    def test_get_space_pages_paginates_and_reports_more(self, v2_adapter, mock_session):
+        space_lookup = self._response({"results": [{"id": "42"}]})
+        first = self._response(
+            {
+                "results": [{"id": "1"}, {"id": "2"}],
+                "_links": {"next": "/wiki/api/v2/spaces/42/pages?cursor=c1"},
+            }
+        )
+        mock_session.get.side_effect = [space_lookup, first]
+        pages, has_more = v2_adapter.get_space_pages("KEY", limit=2)
+        assert [p["id"] for p in pages] == ["1", "2"]
+        assert has_more is True
+        assert (
+            mock_session.get.call_args_list[1]
+            .args[0]
+            .endswith("/api/v2/spaces/42/pages")
+        )
+
+    def test_get_space_pages_complete_space(self, v2_adapter, mock_session):
+        space_lookup = self._response({"results": [{"id": "42"}]})
+        only = self._response({"results": [{"id": "1"}]})
+        mock_session.get.side_effect = [space_lookup, only]
+        pages, has_more = v2_adapter.get_space_pages("KEY", limit=10)
+        assert len(pages) == 1 and has_more is False

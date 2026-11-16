@@ -3886,3 +3886,69 @@ class TestUpdatePageSection:
             )
 
         pages_mixin.preprocessor.markdown_to_confluence_storage.assert_not_called()
+
+
+class TestSpacePageTreeCloudV2:
+    """get_space_page_tree on Cloud OAuth: v1 content listing is gone, v2 is used."""
+
+    @pytest.fixture
+    def pages_mixin(self, confluence_client):
+        with patch(
+            "mcp_atlassian.confluence.pages.ConfluenceClient.__init__"
+        ) as mock_init:
+            mock_init.return_value = None
+            mixin = PagesMixin()
+            mixin.confluence = MagicMock()
+            mixin.config = confluence_client.config
+            mixin.preprocessor = confluence_client.preprocessor
+            return mixin
+
+    def test_tree_rebuilt_from_parent_ids(self, pages_mixin):
+        adapter = MagicMock()
+        adapter.get_space_pages.return_value = (
+            [
+                {"id": "3", "title": "Grandchild", "parentId": "2", "position": 1},
+                {"id": "1", "title": "Root", "parentId": None, "position": 5},
+                {"id": "2", "title": "Child", "parentId": "1", "position": 2},
+            ],
+            False,
+        )
+        with patch.object(
+            PagesMixin, "_v2_adapter", new_callable=PropertyMock, return_value=adapter
+        ):
+            result = pages_mixin.get_space_page_tree("KEY", limit=50)
+
+        pages_mixin.confluence.get_all_pages_from_space_raw.assert_not_called()
+        assert result["space_key"] == "KEY"
+        assert result["total_pages"] == 3
+        assert result["has_more"] is False
+        assert [(p["id"], p["depth"], p["parent_id"]) for p in result["pages"]] == [
+            ("1", 0, None),
+            ("2", 1, "1"),
+            ("3", 2, "2"),
+        ]
+
+    def test_empty_space(self, pages_mixin):
+        adapter = MagicMock()
+        adapter.get_space_pages.return_value = ([], False)
+        with patch.object(
+            PagesMixin, "_v2_adapter", new_callable=PropertyMock, return_value=adapter
+        ):
+            result = pages_mixin.get_space_page_tree("KEY")
+        assert result == {
+            "space_key": "KEY",
+            "total_pages": 0,
+            "has_more": False,
+            "pages": [],
+        }
+
+    def test_truncation_flag_passes_through(self, pages_mixin):
+        adapter = MagicMock()
+        adapter.get_space_pages.return_value = (
+            [{"id": "1", "title": "A", "parentId": None}],
+            True,
+        )
+        with patch.object(
+            PagesMixin, "_v2_adapter", new_callable=PropertyMock, return_value=adapter
+        ):
+            assert pages_mixin.get_space_page_tree("KEY")["has_more"] is True
